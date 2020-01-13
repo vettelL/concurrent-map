@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-var SHARD_COUNT = 32
+var SHARD_COUNT = 1024
 
 // A "thread" safe map of type string:Anything.
 // To avoid lock bottlenecks this map is dived to several (SHARD_COUNT) map shards.
@@ -15,6 +15,8 @@ type ConcurrentMap []*ConcurrentMapShared
 type ConcurrentMapShared struct {
 	items        map[string]interface{}
 	sync.RWMutex // Read Write mutex, guards access to internal map.
+
+	coLoad func(key string) (interface{}, error)
 }
 
 // Creates a new concurrent map.
@@ -26,7 +28,15 @@ func New() ConcurrentMap {
 	return m
 }
 
-// GetShard returns shard under given key
+func NewV2(coLoad func(key string) (interface{}, error)) ConcurrentMap {
+	m := make(ConcurrentMap, SHARD_COUNT)
+	for i := 0; i < SHARD_COUNT; i++ {
+		m[i] = &ConcurrentMapShared{items: make(map[string]interface{}), coLoad: coLoad}
+	}
+	return m
+}
+
+// Returns shard under given key
 func (m ConcurrentMap) GetShard(key string) *ConcurrentMapShared {
 	return m[uint(fnv32(key))%uint(SHARD_COUNT)]
 }
@@ -79,7 +89,7 @@ func (m ConcurrentMap) SetIfAbsent(key string, value interface{}) bool {
 	return !ok
 }
 
-// Get retrieves an element from map under given key.
+// Retrieves an element from map under given key.
 func (m ConcurrentMap) Get(key string) (interface{}, bool) {
 	// Get shard
 	shard := m.GetShard(key)
@@ -90,7 +100,31 @@ func (m ConcurrentMap) Get(key string) (interface{}, bool) {
 	return val, ok
 }
 
-// Count returns the number of elements within the map.
+// Retrieves an element from map under given key.
+func (m ConcurrentMap) GetV2(key string) (interface{}, error) {
+	var err error
+	val, ok := m.Get(key)
+	if !ok {
+		if m[0].coLoad != nil {
+			shard := m.GetShard(key)
+			shard.Lock()
+			// 再判断一次
+			if val, ok := shard.items[key]; ok {
+				shard.Unlock()
+				return val, nil
+			}
+			// 触发加载
+			val, err = m[0].coLoad(key)
+			if err == nil {
+				shard.items[key] = val
+			}
+			shard.Unlock()
+		}
+	}
+	return val, err
+}
+
+// Returns the number of elements within the map.
 func (m ConcurrentMap) Count() int {
 	count := 0
 	for i := 0; i < SHARD_COUNT; i++ {
@@ -113,7 +147,7 @@ func (m ConcurrentMap) Has(key string) bool {
 	return ok
 }
 
-// Remove removes an element from the map.
+// Removes an element from the map.
 func (m ConcurrentMap) Remove(key string) {
 	// Try to get shard.
 	shard := m.GetShard(key)
@@ -142,7 +176,7 @@ func (m ConcurrentMap) RemoveCb(key string, cb RemoveCb) bool {
 	return remove
 }
 
-// Pop removes an element from the map and returns it
+// Removes an element from the map and returns it
 func (m ConcurrentMap) Pop(key string) (v interface{}, exists bool) {
 	// Try to get shard.
 	shard := m.GetShard(key)
@@ -153,7 +187,7 @@ func (m ConcurrentMap) Pop(key string) (v interface{}, exists bool) {
 	return v, exists
 }
 
-// IsEmpty checks if map is empty.
+// Checks if map is empty.
 func (m ConcurrentMap) IsEmpty() bool {
 	return m.Count() == 0
 }
@@ -164,7 +198,7 @@ type Tuple struct {
 	Val interface{}
 }
 
-// Iter returns an iterator which could be used in a for range loop.
+// Returns an iterator which could be used in a for range loop.
 //
 // Deprecated: using IterBuffered() will get a better performence
 func (m ConcurrentMap) Iter() <-chan Tuple {
@@ -174,7 +208,7 @@ func (m ConcurrentMap) Iter() <-chan Tuple {
 	return ch
 }
 
-// IterBuffered returns a buffered iterator which could be used in a for range loop.
+// Returns a buffered iterator which could be used in a for range loop.
 func (m ConcurrentMap) IterBuffered() <-chan Tuple {
 	chans := snapshot(m)
 	total := 0
@@ -228,7 +262,7 @@ func fanIn(chans []chan Tuple, out chan Tuple) {
 	close(out)
 }
 
-// Items returns all items as map[string]interface{}
+// Returns all items as map[string]interface{}
 func (m ConcurrentMap) Items() map[string]interface{} {
 	tmp := make(map[string]interface{})
 
@@ -259,7 +293,7 @@ func (m ConcurrentMap) IterCb(fn IterCb) {
 	}
 }
 
-// Keys returns all keys as []string
+// Return all keys as []string
 func (m ConcurrentMap) Keys() []string {
 	count := m.Count()
 	ch := make(chan string, count)
